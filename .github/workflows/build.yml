@@ -118,11 +118,14 @@ jobs:
           import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
           import net.minecraft.client.Minecraft;
           import net.minecraft.client.multiplayer.ClientLevel;
+          import net.minecraft.core.BlockPos;
           import net.minecraft.core.particles.DustParticleOptions;
           import net.minecraft.network.chat.Component;
           import net.minecraft.world.entity.Entity;
           import net.minecraft.world.entity.EntitySpawnReason;
           import net.minecraft.world.entity.EntityTypes;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.phys.AABB;
           import net.minecraft.world.phys.Vec3;
 
           import java.util.ArrayList;
@@ -130,12 +133,44 @@ jobs:
           import java.util.concurrent.ThreadLocalRandom;
 
           public class FarirMod implements ClientModInitializer {
-              private static final int MAX_LIGHTS = 50;
+              private static final int MAX_LIGHTS = 30;
               private static final List<Light> LIGHTS = new ArrayList<>();
               private static int nextFakeId = -1_000_000;
 
-              private record Light(String name, double x, double y, double z,
-                                   DustParticleOptions particle, Entity label) {}
+              /** Дальше этого расстояния (в блоках) огонёк телепортируется к игроку. */
+              private static int maxDistance = 16;
+
+              private static final class Light {
+                  final String name;
+                  final DustParticleOptions body;
+                  final DustParticleOptions eyes;
+                  Entity label;
+
+                  Vec3 pos;
+                  Vec3 vel = Vec3.ZERO;
+                  Vec3 look;
+
+                  double angle;
+                  double angSpeed;
+                  double radius;
+                  double height;
+                  double phase;
+
+                  int wanderTicks;
+                  int lookTicks;
+                  int blinkTicks;
+                  int stuckTicks;
+                  Player lookTarget;
+
+                  Light(String name, DustParticleOptions body, DustParticleOptions eyes, Entity label, Vec3 pos, Vec3 look) {
+                      this.name = name;
+                      this.body = body;
+                      this.eyes = eyes;
+                      this.label = label;
+                      this.pos = pos;
+                      this.look = look;
+                  }
+              }
 
               @Override
               public void onInitializeClient() {
@@ -151,6 +186,18 @@ jobs:
                       root.then(ClientCommands.literal("remove")
                           .then(ClientCommands.argument("name", StringArgumentType.word())
                               .executes(ctx -> remove(ctx.getSource(), StringArgumentType.getString(ctx, "name")))));
+
+                      root.then(ClientCommands.literal("distance")
+                          .executes(ctx -> {
+                              ctx.getSource().sendFeedback(Component.literal("Телепорт к игроку дальше " + maxDistance + " блоков"));
+                              return 1;
+                          })
+                          .then(ClientCommands.argument("blocks", IntegerArgumentType.integer(2, 256))
+                              .executes(ctx -> {
+                                  maxDistance = IntegerArgumentType.getInteger(ctx, "blocks");
+                                  ctx.getSource().sendFeedback(Component.literal("Теперь огоньки телепортируются к игроку дальше " + maxDistance + " блоков"));
+                                  return 1;
+                              })));
 
                       root.then(ClientCommands.argument("name", StringArgumentType.word())
                           .then(ClientCommands.argument("r", IntegerArgumentType.integer(0, 255))
@@ -169,10 +216,13 @@ jobs:
                   ClientTickEvents.END_CLIENT_TICK.register(FarirMod::tick);
               }
 
+              // ---------------------------------------------------------------- команды
+
               private static int spawn(FabricClientCommandSource source, String name, int r, int g, int b) {
                   Minecraft mc = Minecraft.getInstance();
                   ClientLevel level = mc.level;
-                  if (mc.player == null || level == null) return 0;
+                  Player owner = mc.player;
+                  if (owner == null || level == null) return 0;
 
                   if (LIGHTS.size() >= MAX_LIGHTS) {
                       source.sendError(Component.literal("Слишком много огоньков (максимум " + MAX_LIGHTS + ")"));
@@ -180,23 +230,28 @@ jobs:
                   }
                   removeByName(name);
 
-                  // Огонёк появляется в 2 блоках перед глазами игрока
-                  Vec3 pos = mc.player.getEyePosition().add(mc.player.getLookAngle().scale(2.0));
+                  // Появляется в 2 блоках перед игроком (если там стена, то рядом с ним)
+                  Vec3 pos = owner.getEyePosition().add(owner.getLookAngle().scale(2.0));
+                  if (solidAt(level, pos.x, pos.y, pos.z)) {
+                      pos = owner.position().add(0.0, 1.0, 0.0);
+                  }
 
-                  // Невидимая подставка только на клиенте: нужна ради надписи с именем
-                  var label = EntityTypes.ARMOR_STAND.create(level, EntitySpawnReason.COMMAND);
+                  Entity label = createLabel(level, name, pos);
                   if (label == null) return 0;
-                  label.setId(nextFakeId--);
-                  label.setInvisible(true);
-                  label.setNoGravity(true);
-                  label.setSilent(true);
-                  label.setCustomName(Component.literal(name));
-                  label.setCustomNameVisible(true);
-                  label.setPos(pos.x, pos.y - 2.2, pos.z);
-                  level.addEntity(label);
 
-                  int rgb = (r << 16) | (g << 8) | b;
-                  LIGHTS.add(new Light(name, pos.x, pos.y, pos.z, new DustParticleOptions(rgb, 1.0f), label));
+                  // Цвет глаз: тот же цвет, но на 50% ближе к белому
+                  int body = (r << 16) | (g << 8) | b;
+                  int eyes = (lighten(r) << 16) | (lighten(g) << 8) | lighten(b);
+
+                  Light l = new Light(name,
+                      new DustParticleOptions(body, 1.0f),
+                      new DustParticleOptions(eyes, 0.5f),
+                      label, pos, owner.getLookAngle().scale(-1.0));
+                  ThreadLocalRandom rnd = ThreadLocalRandom.current();
+                  l.angle = rnd.nextDouble(0.0, Math.PI * 2.0);
+                  l.phase = rnd.nextDouble(0.0, Math.PI * 2.0);
+                  l.wanderTicks = 0;
+                  LIGHTS.add(l);
 
                   source.sendFeedback(Component.literal("Огонёк «" + name + "» создан"));
                   return 1;
@@ -214,8 +269,8 @@ jobs:
               private static boolean removeByName(String name) {
                   for (int i = 0; i < LIGHTS.size(); i++) {
                       Light l = LIGHTS.get(i);
-                      if (l.name().equalsIgnoreCase(name)) {
-                          l.label().discard();
+                      if (l.name.equalsIgnoreCase(name)) {
+                          l.label.discard();
                           LIGHTS.remove(i);
                           return true;
                       }
@@ -224,27 +279,210 @@ jobs:
               }
 
               private static void clearAll() {
-                  for (Light l : LIGHTS) l.label().discard();
+                  for (Light l : LIGHTS) l.label.discard();
                   LIGHTS.clear();
+              }
+
+              private static int lighten(int c) {
+                  return c + (int) ((255 - c) * 0.5);
+              }
+
+              // ---------------------------------------------------------------- надпись с именем
+
+              /** Невидимая подставка только на клиенте: нужна ради надписи с именем. */
+              private static Entity createLabel(ClientLevel level, String name, Vec3 pos) {
+                  var label = EntityTypes.ARMOR_STAND.create(level, EntitySpawnReason.COMMAND);
+                  if (label == null) return null;
+                  label.setId(nextFakeId--);
+                  label.setInvisible(true);
+                  label.setNoGravity(true);
+                  label.setSilent(true);
+                  label.setCustomName(Component.literal(name));
+                  label.setCustomNameVisible(true);
+                  moveLabel(label, pos);
+                  level.addEntity(label);
+                  return label;
+              }
+
+              private static void moveLabel(Entity label, Vec3 pos) {
+                  label.setPos(pos.x, pos.y - 2.2, pos.z);
+                  // Крошечный хитбокс, чтобы невидимая подставка не мешала целиться и ломать блоки
+                  label.setBoundingBox(new AABB(
+                      pos.x - 0.1, pos.y - 0.1, pos.z - 0.1,
+                      pos.x + 0.1, pos.y + 0.1, pos.z + 0.1));
+              }
+
+              // ---------------------------------------------------------------- «мозги»
+
+              private static boolean solidAt(ClientLevel level, double x, double y, double z) {
+                  BlockPos bp = BlockPos.containing(x, y, z);
+                  return !level.getBlockState(bp).getCollisionShape(level, bp).isEmpty();
               }
 
               private static void tick(Minecraft mc) {
                   ClientLevel level = mc.level;
-                  if (level == null) {
+                  Player owner = mc.player;
+                  if (level == null || owner == null) {
                       LIGHTS.clear();
                       return;
                   }
-                  LIGHTS.removeIf(l -> l.label().isRemoved() || l.label().level() != level);
 
                   ThreadLocalRandom rnd = ThreadLocalRandom.current();
+                  List<Light> dead = new ArrayList<>();
+
                   for (Light l : LIGHTS) {
-                      for (int i = 0; i < 3; i++) {
-                          level.addParticle(l.particle(),
-                              l.x() + rnd.nextDouble(-0.12, 0.12),
-                              l.y() + rnd.nextDouble(-0.12, 0.12),
-                              l.z() + rnd.nextDouble(-0.12, 0.12),
-                              0.0, 0.0, 0.0);
+                      // Сменился мир/измерение или подставка пропала: переезжаем к игроку заново
+                      if (l.label.level() != level || l.label.isRemoved()) {
+                          Entity fresh = createLabel(level, l.name, l.pos);
+                          if (fresh == null) {
+                              dead.add(l);
+                              continue;
+                          }
+                          l.label = fresh;
+                          teleportToOwner(level, owner, l);
                       }
+                      think(level, owner, l, rnd);
+                  }
+                  LIGHTS.removeAll(dead);
+              }
+
+              private static void think(ClientLevel level, Player owner, Light l, ThreadLocalRandom rnd) {
+                  Vec3 ownerPos = owner.position();
+                  Vec3 eye = owner.getEyePosition();
+
+                  // 1. Слишком далеко -> телепорт к игроку
+                  if (l.pos.distanceTo(ownerPos) > maxDistance) {
+                      teleportToOwner(level, owner, l);
+                  }
+
+                  // 2. Иногда меняем «настроение»: скорость и радиус кружения, высоту
+                  if (--l.wanderTicks <= 0) {
+                      l.wanderTicks = 40 + rnd.nextInt(80);
+                      l.angSpeed = (rnd.nextBoolean() ? 1.0 : -1.0) * rnd.nextDouble(0.01, 0.06);
+                      l.radius = rnd.nextDouble(1.0, 2.2);
+                      l.height = rnd.nextDouble(1.2, 2.4);
+                  }
+                  l.angle += l.angSpeed;
+                  l.phase += 0.12;
+
+                  // 3. Куда хотим лететь: кружим вокруг игрока и покачиваемся
+                  Vec3 target = ownerPos.add(
+                      Math.cos(l.angle) * l.radius,
+                      l.height + Math.sin(l.phase) * 0.15,
+                      Math.sin(l.angle) * l.radius);
+                  if (solidAt(level, target.x, target.y, target.z)) {
+                      target = ownerPos.add(0.0, 1.0, 0.0);
+                  }
+
+                  // 4. Плавный разгон к цели
+                  double dist = l.pos.distanceTo(ownerPos);
+                  double maxSpeed = dist > 6.0 ? 0.6 : 0.22;
+                  Vec3 v = l.vel.scale(0.82).add(target.subtract(l.pos).scale(0.06));
+                  double sp = v.length();
+                  if (sp > maxSpeed) v = v.scale(maxSpeed / sp);
+
+                  // 5. Движение по осям с проверкой стен (скользим вдоль стены, насквозь не проходим)
+                  double px = l.pos.x;
+                  double py = l.pos.y;
+                  double pz = l.pos.z;
+                  double vx = v.x;
+                  double vy = v.y;
+                  double vz = v.z;
+                  if (solidAt(level, px + vx, py, pz)) vx = 0.0; else px += vx;
+                  if (solidAt(level, px, py + vy, pz)) vy = 0.0; else py += vy;
+                  if (solidAt(level, px, py, pz + vz)) vz = 0.0; else pz += vz;
+
+                  Vec3 newPos = new Vec3(px, py, pz);
+                  double moved = newPos.distanceTo(l.pos);
+                  l.vel = new Vec3(vx, vy, vz);
+                  l.pos = newPos;
+
+                  // 6. Застрял за стеной далеко от цели -> телепорт к игроку
+                  if (target.distanceTo(l.pos) > 2.5 && moved < 0.01) l.stuckTicks++; else l.stuckTicks = 0;
+                  if (l.stuckTicks > 40) teleportToOwner(level, owner, l);
+
+                  // 7. Взгляд: иногда смотрим на ближайших игроков, иначе по ходу движения или на хозяина
+                  if (l.lookTicks > 0) {
+                      l.lookTicks--;
+                      if (l.lookTarget == null || l.lookTarget.isRemoved()) l.lookTicks = 0;
+                  }
+                  if (l.lookTicks <= 0 && rnd.nextInt(50) == 0) {
+                      List<Player> near = new ArrayList<>();
+                      for (Player p : level.players()) {
+                          if (p.position().distanceTo(l.pos) < 16.0) near.add(p);
+                      }
+                      if (!near.isEmpty()) {
+                          l.lookTarget = near.get(rnd.nextInt(near.size()));
+                          l.lookTicks = 40 + rnd.nextInt(80);
+                      }
+                  }
+
+                  Vec3 desired;
+                  if (l.lookTicks > 0 && l.lookTarget != null) {
+                      desired = l.lookTarget.getEyePosition().subtract(l.pos);
+                  } else if (l.vel.lengthSqr() > 0.0009) {
+                      desired = l.vel;
+                  } else {
+                      desired = eye.subtract(l.pos);
+                  }
+                  if (desired.lengthSqr() > 1.0E-6) {
+                      Vec3 want = desired.normalize();
+                      Vec3 mix = l.look.lerp(want, 0.2);
+                      l.look = mix.lengthSqr() > 1.0E-6 ? mix.normalize() : want;
+                  }
+
+                  // 8. Надпись едет за огоньком
+                  moveLabel(l.label, l.pos);
+
+                  // 9. Рисуем: тело из частиц
+                  for (int i = 0; i < 3; i++) {
+                      level.addParticle(l.body,
+                          l.pos.x + rnd.nextDouble(-0.1, 0.1),
+                          l.pos.y + rnd.nextDouble(-0.1, 0.1),
+                          l.pos.z + rnd.nextDouble(-0.1, 0.1),
+                          0.0, 0.0, 0.0);
+                  }
+
+                  // 10. Глаза: два светлых пятнышка спереди, иногда моргают
+                  if (l.blinkTicks > 0) {
+                      l.blinkTicks--;
+                  } else if (rnd.nextInt(90) == 0) {
+                      l.blinkTicks = 4;
+                  }
+                  if (l.blinkTicks == 0) {
+                      Vec3 side = l.look.cross(new Vec3(0.0, 1.0, 0.0));
+                      side = side.lengthSqr() < 1.0E-4 ? new Vec3(1.0, 0.0, 0.0) : side.normalize();
+                      Vec3 center = l.pos.add(l.look.scale(0.13)).add(0.0, 0.04, 0.0);
+                      Vec3 left = center.subtract(side.scale(0.07));
+                      Vec3 right = center.add(side.scale(0.07));
+                      for (int i = 0; i < 2; i++) {
+                          level.addParticle(l.eyes, left.x, left.y, left.z, 0.0, 0.0, 0.0);
+                          level.addParticle(l.eyes, right.x, right.y, right.z, 0.0, 0.0, 0.0);
+                      }
+                  }
+              }
+
+              private static void teleportToOwner(ClientLevel level, Player owner, Light l) {
+                  Vec3 spot = owner.position().add(
+                      Math.cos(l.angle) * 1.2,
+                      1.6,
+                      Math.sin(l.angle) * 1.2);
+                  if (solidAt(level, spot.x, spot.y, spot.z)) {
+                      spot = owner.position().add(0.0, 1.0, 0.0);
+                  }
+                  l.pos = spot;
+                  l.vel = Vec3.ZERO;
+                  l.stuckTicks = 0;
+                  moveLabel(l.label, spot);
+
+                  // Маленькая вспышка при телепорте
+                  ThreadLocalRandom rnd = ThreadLocalRandom.current();
+                  for (int i = 0; i < 12; i++) {
+                      level.addParticle(l.body,
+                          spot.x + rnd.nextDouble(-0.3, 0.3),
+                          spot.y + rnd.nextDouble(-0.3, 0.3),
+                          spot.z + rnd.nextDouble(-0.3, 0.3),
+                          0.0, 0.0, 0.0);
                   }
               }
           }
